@@ -692,25 +692,56 @@ def emi_list():
     return render_template('emi_list.html', plans=plans)
 
 
+
 @app.post('/orders/<int:order_id>/delete')
 @auth('admin')
 def delete_bill(order_id):
     order = db.get_or_404(Order, order_id)
-    if order.deleted_at: abort(409)
-    if request.form.get('confirm') != order.order_no: abort(400, 'Enter the exact bill number')
-    if order.status in ('PAID', 'PAYMENT_REPORTED') or (order.status == 'EMI_PLAN' and any(x.status in ('PAID', 'PAYMENT_REPORTED') for x in order.installments)):
-        abort(409, 'Paid bills and plans with paid installments cannot be deleted')
+
+    if order.deleted_at is not None:
+        abort(409, 'Bill is already in Trash')
+
+    if order.parent_order_id is not None:
+        abort(409, 'Delete EMI bills through their parent order')
+
+    if request.form.get('confirm') != order.order_no:
+        abort(400, 'Enter the exact bill number')
+
+    # Protect active EMI plans and ongoing payments.
     if order.status == 'EMI_PLAN':
-        if any(x.gateway_order_id or x.payment_ref for x in order.installments): abort(409, 'Plan contains payment activity')
-        for child in order.installments:
-            child.deleted_at = now(); child.deleted_by = str(session.get('user_id'))
-    elif order.gateway_order_id or order.payment_ref:
-        abort(409, 'Bills with gateway payment attempts cannot be deleted')
-    order.deleted_at = now(); order.deleted_by = str(session.get('user_id'))
-    log('BILL_SOFT_DELETED', order)
+        abort(409, 'Close or settle the EMI plan before archiving')
+
+    if order.status == 'PAYMENT_REPORTED':
+        abort(409, 'Verify the reported payment first')
+
+    # Do not archive while a foreclosure is pending.
+    if EMIForeclosure.query.filter_by(
+        parent_order_id=order.id,
+        status='PENDING'
+    ).first():
+        abort(409, 'Foreclosure payment is pending')
+
+    # Keep installment history attached to the parent.
+    for child in order.installments:
+        child.deleted_at = now()
+        child.deleted_by = str(session.get('user_id'))
+
+    # Archive the bill without changing payment status,
+    # gateway references or transaction history.
+    order.deleted_at = now()
+    order.deleted_by = str(session.get('user_id'))
+
+    log(
+        'BILL_SOFT_DELETED',
+        order,
+        details='Archived by admin; payment records retained'
+    )
+
     db.session.commit()
-    flash('Bill moved to Trash', 'success')
+
+    flash('Bill moved to Trash. Payment history preserved.', 'success')
     return redirect(url_for('orders'))
+
 
 
 @app.get('/trash')
